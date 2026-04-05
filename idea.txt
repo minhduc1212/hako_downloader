@@ -1,0 +1,4 @@
+"""#get text
+    page.wait_for_selector("#chapter-content", timeout=10000)
+    content = page.locator("#chapter-content").inner_text() 
+    print(content)"""
