@@ -21,7 +21,7 @@ from playwright.async_api import async_playwright, BrowserContext, Page
 # ─────────────────────────────────────────────
 @dataclass
 class Config:
-    output_dir:          Path  = Path("output")
+    output_dir:          Path  = Path("output") 
     url_list_file:       str   = "url_list.txt"
     progress_file:       str   = "progress.json"
     log_file:            str   = "crawler.log"
