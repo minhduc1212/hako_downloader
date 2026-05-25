@@ -1,6 +1,7 @@
 from playwright.sync_api import sync_playwright
 from time import sleep
 import json
+import random 
 
 base_url = "https://docln.sbs/danh-sach?truyendich=1&sangtac=1&convert=1&dangtienhanh=1&tamngung=1&hoanthanh=1&sapxep=tentruyen&page="
 url_list = []
@@ -28,7 +29,7 @@ if current_page > 1:
 
 with sync_playwright() as p:
     context = p.chromium.launch_persistent_context(
-                user_data_dir="./hako", 
+                user_data_dir="./hako_plw", 
                 headless=False,
                 args=["--disable-blink-features=AutomationControlled"],
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -70,6 +71,6 @@ with sync_playwright() as p:
         # Chuyển sang trang tiếp theo
         current_page += 1
 
-        sleep(5)  # Tạm dừng 5 giây giữa các trang để tránh bị chặn
+        sleep(random.uniform(3, 7))  # Tạm dừng 3-7 giây giữa các trang để tránh bị chặn
 
 print("Hoàn tất!")
