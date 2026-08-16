@@ -1,0 +1,23 @@
+# ==============================================================================
+# HAKO CRAWLER - PROXY & TOR LIST
+# ==============================================================================
+# Mỗi dòng là một địa chỉ Proxy. Hệ thống sẽ tự động xoay vòng (round-robin)
+# và kiểm tra sức khỏe proxy trước khi gửi request.
+#
+# 1. CẤU HÌNH TOR (Mặc định khi bật Tor Service hoặc Tor Browser trên máy):
+socks5://127.0.0.1:9050
+socks5://127.0.0.1:9150
+
+# 2. PROXY HTTP / HTTPS:
+# http://123.45.67.89:8080
+# http://username:password@123.45.67.89:8080
+
+# 3. PROXY SOCKS5 / SOCKS4:
+# socks5://123.45.67.89:1080
+# socks5://username:password@123.45.67.89:1080
+
+# 4. DANH SÁCH PROXY XOAY VÒNG / FREE PROXY MẪU:
+# http://47.243.174.195:8080
+# http://103.155.217.151:8080
+# socks5://184.178.172.18:4145
+# socks5://72.210.252.134:46164
