@@ -1,5 +1,5 @@
 """
-Chapter Content and Inline Image Parser with Noise and Ad Filtering
+Chapter Content and Inline Image Parser with Noise/Ad Filtering and Direct Decryption Engine
 """
 
 import re
@@ -8,6 +8,7 @@ from typing import List, Optional
 from bs4 import BeautifulSoup
 from ..utils.helpers import normalize_url, clean_text
 from ..utils.vietnamese import clean_vietnamese_text
+from ..utils.crypto import decrypt_hako_chapter
 
 
 @dataclass
@@ -22,7 +23,7 @@ class ParsedChapterContent:
 
 
 class ChapterParser:
-    """Parses rendered chapter HTML into clean text, html, and image lists."""
+    """Parses raw chapter HTML into clean text, html, and image lists with direct XOR decryption."""
 
     # Unwanted advertisement / site notice phrases to filter out
     AD_KEYWORDS = [
@@ -66,74 +67,95 @@ class ChapterParser:
             if date_match:
                 publish_date = date_match.group(1).strip()
 
-        # Content container
-        content_el = soup.select_one("#chapter-content, .chapter-content, .reading-content")
-
         text_content = ""
         html_content = ""
         image_urls: List[str] = []
 
-        if content_el:
-            # 1. Extract all inline images
-            for img in content_el.select("img"):
-                src = img.get("src") or img.get("data-src")
-                if src:
-                    full_img_url = normalize_url(src, base_url)
-                    if full_img_url not in image_urls:
-                        image_urls.append(full_img_url)
+        # ── 1. Check for Encrypted Chapter Payload (data-c + data-k) ──
+        protected_div = soup.find(attrs={"data-c": True, "data-k": True}) or soup.find("div", id="chapter-c-protected")
 
-            # 2. Clean unwanted elements (display:none, script, style, ads, duplicate titles)
-            for el in content_el.select("script, style, noscript, [style*='display: none'], [style*='display:none']"):
-                el.decompose()
+        if protected_div and protected_div.get("data-c") and protected_div.get("data-k"):
+            data_c = protected_div.get("data-c")
+            data_k = protected_div.get("data-k")
+            decrypted_html = decrypt_hako_chapter(data_c, data_k)
 
-            for ad_box in content_el.select(".notice-item, .alert, .reading-notice, a[href*='shopee'], a[href*='lazada']"):
-                ad_box.decompose()
+            if decrypted_html:
+                c_soup = BeautifulSoup(decrypted_html, "html.parser")
 
-            # 3. Extract clean paragraphs (<p> elements)
-            p_tags = content_el.find_all("p")
-            paragraphs: List[str] = []
+                # Extract images
+                for img in c_soup.select("img"):
+                    src = img.get("src") or img.get("data-src")
+                    if src:
+                        full_img_url = normalize_url(src, base_url)
+                        if full_img_url not in image_urls:
+                            image_urls.append(full_img_url)
 
-            if p_tags:
-                for p in p_tags:
-                    # Ignore p tags inside banners or ads
-                    p_str = p.get_text().strip()
-                    if not p_str:
-                        continue
-                    # Check for ad keywords
-                    p_lower = p_str.lower()
-                    if any(kw in p_lower for kw in ChapterParser.AD_KEYWORDS):
-                        continue
-                    # Check if p is just the chapter title or volume title repeated
-                    if p_str == title or p_str == volume_title:
-                        continue
-                    paragraphs.append(p_str)
-                text_content = "\n\n".join(paragraphs)
-            else:
-                # Fallback if no <p> tags exist
-                raw_text = clean_text(content_el.get_text())
-                lines = raw_text.split("\n")
-                filtered_lines = []
-                for line in lines:
-                    line_s = line.strip()
-                    if not line_s:
-                        continue
-                    line_lower = line_s.lower()
-                    if any(kw in line_lower for kw in ChapterParser.AD_KEYWORDS):
-                        continue
-                    if line_s == title or line_s == volume_title:
-                        continue
-                    filtered_lines.append(line_s)
-                text_content = "\n\n".join(filtered_lines)
+                # Extract paragraphs
+                p_tags = c_soup.find_all("p")
+                paragraphs: List[str] = []
+                if p_tags:
+                    for p in p_tags:
+                        p_str = p.get_text().strip()
+                        if not p_str:
+                            continue
+                        p_lower = p_str.lower()
+                        if any(kw in p_lower for kw in ChapterParser.AD_KEYWORDS):
+                            continue
+                        if p_str == title or p_str == volume_title:
+                            continue
+                        paragraphs.append(p_str)
+                    text_content = "\n\n".join(paragraphs)
+                else:
+                    text_content = clean_text(c_soup.get_text())
 
-            html_content = str(content_el)
-            text_content = clean_vietnamese_text(text_content)
+                html_content = decrypted_html
 
-            # Recalculate word count if not available from header
-            if word_count == 0 and text_content:
-                word_count = len(text_content.split())
+        # ── 2. Fallback: Standard Unprotected Chapter Content ──
+        if not text_content:
+            content_el = soup.select_one("#chapter-content, .chapter-content, .reading-content")
+            if content_el:
+                # Extract inline images
+                for img in content_el.select("img"):
+                    src = img.get("src") or img.get("data-src")
+                    if src:
+                        full_img_url = normalize_url(src, base_url)
+                        if full_img_url not in image_urls:
+                            image_urls.append(full_img_url)
 
+                # Clean noise
+                for el in content_el.select("script, style, noscript, [style*='display: none'], [style*='display:none']"):
+                    el.decompose()
+                for ad_box in content_el.select(".notice-item, .alert, .reading-notice, a[href*='shopee'], a[href*='lazada']"):
+                    ad_box.decompose()
+
+                p_tags = content_el.find_all("p")
+                paragraphs: List[str] = []
+                if p_tags:
+                    for p in p_tags:
+                        p_str = p.get_text().strip()
+                        if not p_str:
+                            continue
+                        p_lower = p_str.lower()
+                        if any(kw in p_lower for kw in ChapterParser.AD_KEYWORDS):
+                            continue
+                        if p_str == title or p_str == volume_title:
+                            continue
+                        paragraphs.append(p_str)
+                    text_content = "\n\n".join(paragraphs)
+                else:
+                    raw_text = clean_text(content_el.get_text())
+                    lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
+                    filtered = [l for l in lines if not any(kw in l.lower() for kw in ChapterParser.AD_KEYWORDS) and l != title and l != volume_title]
+                    text_content = "\n\n".join(filtered)
+
+                html_content = str(content_el)
+
+        text_content = clean_vietnamese_text(text_content)
         title = clean_vietnamese_text(title)
         volume_title = clean_vietnamese_text(volume_title)
+
+        if word_count == 0 and text_content:
+            word_count = len(text_content.split())
 
         return ParsedChapterContent(
             title=title,

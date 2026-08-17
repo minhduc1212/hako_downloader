@@ -1,14 +1,13 @@
 """
-Async Multi-Worker Crawler Engine Orchestrator
+Async Multi-Worker Crawler Engine Orchestrator (Pure HTTPX + Asyncio)
 """
 
 import asyncio
 import time
 from typing import List, Optional
 from asyncio import Queue
-from playwright.async_api import BrowserContext, Page
+
 from ..config import Settings, CONFIG
-from ..core.browser_manager import BrowserManager
 from ..core.proxy_manager import get_proxy_manager
 from ..core.rate_limiter import SharedCrawlState
 from ..core.retry_manager import PostRetryWorker
@@ -23,35 +22,41 @@ log = get_logger("engine")
 class CrawlerEngine:
     """
     Main asynchronous crawler engine orchestrating multi-workers,
-    shared rate-limiter, browser contexts, and post-retry verification.
+    shared rate-limiter, proxy rotation, and post-retry verification.
     """
 
     def __init__(self, settings: Optional[Settings] = None):
         self.settings = settings or CONFIG
         self.repository = NovelRepository()
         self.proxy_manager = get_proxy_manager()
-        self.browser_manager = BrowserManager(self.settings.crawler, self.proxy_manager)
         self.media_crawler = MediaCrawler(self.settings.media, self.repository, self.proxy_manager)
         self.state = SharedCrawlState(self.settings.crawler)
         self.novel_crawler = NovelCrawler(
-            self.settings.crawler, self.repository, self.media_crawler, self.state, settings=self.settings
+            self.settings.crawler,
+            self.repository,
+            self.media_crawler,
+            self.state,
+            proxy_manager=self.proxy_manager,
+            settings=self.settings,
         )
         self.post_retry_worker = PostRetryWorker(self.repository)
 
     async def _worker(
         self,
         worker_id: int,
-        context: BrowserContext,
         queue: Queue,
         force_recrawl: bool = False,
     ):
-        """Worker task processing novel URLs from queue."""
+        """Worker task processing novel URLs from queue with dedicated HTTP session."""
         log.debug(f"Worker {worker_id} started.")
-        nav_page = await context.new_page()
-        fetch_page = await context.new_page()
-
-        await self.browser_manager.setup_page(nav_page)
-        await self.browser_manager.setup_page(fetch_page)
+        worker_crawler = NovelCrawler(
+            self.settings.crawler,
+            self.repository,
+            self.media_crawler,
+            self.state,
+            proxy_manager=self.proxy_manager,
+            settings=self.settings,
+        )
 
         try:
             while True:
@@ -61,9 +66,7 @@ class CrawlerEngine:
                     break
 
                 try:
-                    await self.novel_crawler.crawl_novel(
-                        nav_page=nav_page,
-                        fetch_page=fetch_page,
+                    await worker_crawler.crawl_novel(
                         novel_url=novel_url,
                         force_recrawl=force_recrawl,
                     )
@@ -73,9 +76,10 @@ class CrawlerEngine:
                     log.error(f"[Worker {worker_id}] Unhandled error on {novel_url}: {e}")
                 finally:
                     queue.task_done()
+                    # Polite pause between novels
+                    await asyncio.sleep(self.state.get_random_page_delay())
         finally:
-            await nav_page.close()
-            await fetch_page.close()
+            await worker_crawler.close_session()
             log.debug(f"Worker {worker_id} finished.")
 
     async def crawl_urls(self, urls: List[str], force_recrawl: bool = False) -> dict:
@@ -88,21 +92,25 @@ class CrawlerEngine:
             return {"total": 0, "completed": 0, "duration": 0.0}
 
         start_time = time.monotonic()
-        log.info(f"Starting crawl for {len(urls)} novels using {self.settings.crawler.num_workers} workers...")
+        effective_workers = max(1, self.settings.crawler.num_workers)
+
+        log.info(
+            f"Starting crawl for {len(urls)} novels using {effective_workers} concurrent worker(s) "
+            f"({'Proxy Pool' if self.proxy_manager.is_enabled else 'Auto-Paced Multi-Worker'})..."
+        )
 
         queue: Queue = asyncio.Queue()
         for url in urls:
             queue.put_nowait(url)
 
-        context = await self.browser_manager.start()
         watcher_task = asyncio.create_task(self.state.backoff_watcher())
 
         try:
             workers = [
                 asyncio.create_task(
-                    self._worker(i + 1, context, queue, force_recrawl=force_recrawl)
+                    self._worker(i + 1, queue, force_recrawl=force_recrawl)
                 )
-                for i in range(self.settings.crawler.num_workers)
+                for i in range(effective_workers)
             ]
             await asyncio.gather(*workers)
         finally:
@@ -117,36 +125,25 @@ class CrawlerEngine:
             log.info("[Post-Retry] Checking for failed items to retry...")
             await self.post_retry_worker.process_pending_retries(self)
 
-        await self.browser_manager.close()
         duration = time.monotonic() - start_time
         log.info(f"[Crawl Finished] Processed {len(urls)} novels in {duration:.1f}s.")
         return {"total": len(urls), "completed": len(urls), "duration": duration}
 
     async def crawl_single_novel(self, novel_url: str, force_recrawl: bool = False) -> bool:
         """Helper to crawl a single novel."""
-        context = await self.browser_manager.start()
-        nav_page = await context.new_page()
-        fetch_page = await context.new_page()
-        await self.browser_manager.setup_page(nav_page)
-        await self.browser_manager.setup_page(fetch_page)
-
         watcher_task = asyncio.create_task(self.state.backoff_watcher())
-        success = False
         try:
             novel_id, total_ch, new_ch = await self.novel_crawler.crawl_novel(
-                nav_page=nav_page,
-                fetch_page=fetch_page,
                 novel_url=novel_url,
                 force_recrawl=force_recrawl,
             )
-            success = novel_id > 0
+            return novel_id > 0
         finally:
             watcher_task.cancel()
-            await nav_page.close()
-            await fetch_page.close()
-            await self.browser_manager.close()
-
-        return success
+            try:
+                await watcher_task
+            except asyncio.CancelledError:
+                pass
 
     async def crawl_single_chapter(
         self,
@@ -157,42 +154,34 @@ class CrawlerEngine:
         chapter_title: str = "",
     ) -> bool:
         """Helper to crawl a single chapter (used in post-retry)."""
-        context = await self.browser_manager.start()
-        fetch_page = await context.new_page()
-        await self.browser_manager.setup_page(fetch_page)
-
-        try:
-            content = await self.novel_crawler.fetch_chapter_content(fetch_page, chapter_url)
-            if content and novel_id:
-                from ..database.models import Chapter
-                chap_model = Chapter(
+        content = await self.novel_crawler.fetch_chapter_content(chapter_url)
+        if content and novel_id:
+            from ..database.models import Chapter
+            chap_model = Chapter(
+                novel_id=novel_id,
+                volume_id=volume_id,
+                chapter_index=chapter_index,
+                title=content.title or chapter_title,
+                url=chapter_url,
+                word_count=content.word_count,
+                publish_date=content.publish_date,
+                text_content=content.text_content,
+                html_content=content.html_content,
+                images=content.image_urls,
+                crawl_status="completed",
+            )
+            chap_id = await self.repository.upsert_chapter(chap_model)
+            if content.image_urls:
+                novel = await self.repository.get_novel_by_id(novel_id)
+                slug = novel.slug if novel else f"novel_{novel_id}"
+                await self.media_crawler.download_all_chapter_images(
                     novel_id=novel_id,
-                    volume_id=volume_id,
-                    chapter_index=chapter_index,
-                    title=content.title or chapter_title,
-                    url=chapter_url,
-                    word_count=content.word_count,
-                    publish_date=content.publish_date,
-                    text_content=content.text_content,
-                    html_content=content.html_content,
-                    images=content.image_urls,
-                    crawl_status="completed",
+                    novel_slug=slug,
+                    chapter_id=chap_id,
+                    image_urls=content.image_urls,
                 )
-                chap_id = await self.repository.upsert_chapter(chap_model)
-                if content.image_urls:
-                    novel = await self.repository.get_novel_by_id(novel_id)
-                    slug = novel.slug if novel else f"novel_{novel_id}"
-                    await self.media_crawler.download_all_chapter_images(
-                        novel_id=novel_id,
-                        novel_slug=slug,
-                        chapter_id=chap_id,
-                        image_urls=content.image_urls,
-                    )
-                return True
-            return False
-        finally:
-            await fetch_page.close()
-            await self.browser_manager.close()
+            return True
+        return False
 
     async def download_single_image(
         self,
@@ -203,5 +192,4 @@ class CrawlerEngine:
         """Helper to retry downloading a single image."""
         if not image_id:
             return False
-        # Fetch image record from DB
         return True

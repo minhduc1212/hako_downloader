@@ -66,14 +66,14 @@ class NovelParser:
 
         # 3. Cover Image
         cover_url = ""
-        cover_el = soup.select_one(".series-cover .img-in-ratio, .series-cover div.content, .series-cover div")
+        cover_el = soup.select_one(".series-cover .img-in-ratio, .series-cover [style*='url'], .series-cover div.content, .series-cover div[style]")
         if cover_el:
             style = cover_el.get("style", "")
             match = re.search(r'url\([\'"]?(.*?)[\'"]?\)', style)
             if match:
                 cover_url = normalize_url(match.group(1), base_url)
         if not cover_url:
-            img_el = soup.select_one(".series-cover img, .series-cover .content img, .series-cover .a6-ratio img")
+            img_el = soup.select_one(".series-cover img, .series-cover .content img, .series-cover .a6-ratio img, .series-cover [data-src]")
             if img_el and (img_el.get("src") or img_el.get("data-src")):
                 cover_url = normalize_url(img_el.get("src") or img_el.get("data-src"), base_url)
 

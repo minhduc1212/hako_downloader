@@ -17,16 +17,16 @@ crawler:
   headless: true
   num_workers: 3
   
-  # Adaptive Rate Limiting
-  max_rps: 2.5
-  min_rps: 0.3
-  chapter_delay_min: 0.8
-  chapter_delay_max: 2.0
-  page_delay_min: 2.0
-  page_delay_max: 4.0
+  # Adaptive Rate Limiting (High-precision dynamic auto-pacing)
+  max_rps: 0.95
+  min_rps: 0.4
+  chapter_delay_min: 0.05
+  chapter_delay_max: 0.15
+  page_delay_min: 0.3
+  page_delay_max: 0.8
   random_jitter: true
   
-  # 429 & Backoff handling
+  # 429 & Backoff handling (Thời gian nghỉ khi gặp 429)
   backoff_429_min: 20.0
   backoff_429_max: 40.0
   
@@ -65,6 +65,7 @@ daily:
   latest_updates_max_pages: 5
   auto_retry_failed: true
   export_txt_on_complete: true
+  feed_url_template: "https://docln.sbs/the-loai/slice-of-life?truyendich=1&sangtac=1&convert=1&dangtienhanh=1&tamngung=1&hoanthanh=1&sapxep=capnhat&page={page}"
 
 export:
   output_dir: "output/novels"   # Thư mục lưu file truyện khi xuất (manual export)

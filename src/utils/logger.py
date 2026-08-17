@@ -1,5 +1,9 @@
+"""
+Logging System: Rich Console & Windows-Safe Rotating File Handler
+"""
+
 import sys
-import io
+import os
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -17,7 +21,6 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.theme import Theme
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 
 custom_theme = Theme({
@@ -37,6 +40,37 @@ console = Console(theme=custom_theme, color_system="auto")
 _logger_initialized = False
 
 
+class SafeRotatingFileHandler(RotatingFileHandler):
+    """
+    Windows-safe RotatingFileHandler that closes the underlying file stream before
+    rotating and gracefully handles Windows file lock PermissionError.
+    """
+
+    def doRollover(self):
+        if self.stream:
+            try:
+                self.stream.flush()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+
+        try:
+            super().doRollover()
+        except (PermissionError, OSError):
+            # On Windows, if file is temporarily held by another thread/process,
+            # truncate cleanly to prevent logging crash
+            try:
+                if self.baseFilename and Path(self.baseFilename).exists():
+                    with open(self.baseFilename, "w", encoding=self.encoding) as f:
+                        f.write(f"--- Log rotated after Windows lock recovery ---\n")
+            except Exception:
+                pass
+        finally:
+            if not self.stream:
+                self.stream = self._open()
+
+
 def setup_logger(
     log_level: str = "INFO",
     log_file: Optional[Path] = None,
@@ -49,8 +83,13 @@ def setup_logger(
     root_logger = logging.getLogger("hako_crawler")
     root_logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
-    # Remove existing handlers
-    root_logger.handlers.clear()
+    # Properly close and remove existing handlers to prevent Windows file lock conflicts
+    for h in root_logger.handlers[:]:
+        try:
+            h.close()
+        except Exception:
+            pass
+        root_logger.removeHandler(h)
 
     # Rich Console Handler
     if rich_console:
@@ -69,7 +108,7 @@ def setup_logger(
         stream_handler = logging.StreamHandler(sys.stdout)
         stream_formatter = logging.Formatter(
             "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
+            datefmt="%Y-%m-%d %H:%M:%S",
         )
         stream_handler.setFormatter(stream_formatter)
         root_logger.addHandler(stream_handler)
@@ -78,7 +117,7 @@ def setup_logger(
     if log_file:
         log_file_path = Path(log_file)
         log_file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = RotatingFileHandler(
+        file_handler = SafeRotatingFileHandler(
             log_file_path,
             maxBytes=max_bytes,
             backupCount=backup_count,
@@ -112,7 +151,7 @@ def print_banner(title: str = "HAKO NOVEL CRAWLER SYSTEM", subtitle: str = "Dail
     banner_text.append(f"  {title}\n", style="bold cyan")
     banner_text.append(f"  {subtitle} | Always Up-To-Date SQLite DB\n", style="dim italic")
     banner_text.append("  Anti-Bot Protection • Proxy/Tor • Rich Logging • Dead-Letter Post-Retry", style="dim green")
-    
+
     panel = Panel(
         banner_text,
         border_style="cyan",

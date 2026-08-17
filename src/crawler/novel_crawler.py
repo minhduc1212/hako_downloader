@@ -1,14 +1,16 @@
 """
-Novel Crawler: Extracts Novel Details, Volumes, Chapters, and Inline Images
+Novel Crawler: Extracts Novel Details, Volumes, Chapters, and Inline Images via High-Speed Async HTTPX Session
 """
 
 import asyncio
 import random
 import time
-from typing import Optional, Set, Tuple
-from playwright.async_api import Page, BrowserContext
+from typing import Optional, Set, Tuple, Dict, Any
+import httpx
+
 from ..config import CrawlerEngineConfig, Settings, CONFIG
 from ..core.rate_limiter import SharedCrawlState
+from ..core.proxy_manager import get_proxy_manager, ProxyManager
 from ..database.models import Novel, Volume, Chapter
 from ..database.repository import NovelRepository
 from ..parsers.novel_parser import NovelParser, ParsedNovelInfo
@@ -18,9 +20,19 @@ from ..utils.logger import get_logger, console
 
 log = get_logger("novel_crawler")
 
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+]
+
 
 class NovelCrawler:
-    """Coordinates crawling of a single novel with full chapter, image, and DB persistence."""
+    """
+    Coordinates high-speed crawling of novels, chapters, and images using persistent HTTPX session
+    with automatic cookie management, browser headers, and direct XOR decryption.
+    """
 
     def __init__(
         self,
@@ -28,108 +40,144 @@ class NovelCrawler:
         repository: NovelRepository,
         media_crawler: MediaCrawler,
         state: SharedCrawlState,
+        proxy_manager: Optional[ProxyManager] = None,
         settings: Optional[Settings] = None,
     ):
         self.config = config
         self.repository = repository
         self.media_crawler = media_crawler
         self.state = state
+        self.proxy_manager = proxy_manager or get_proxy_manager()
         self.settings = settings or CONFIG
+        self._client: Optional[httpx.AsyncClient] = None
+        self._ua = random.choice(USER_AGENTS)
 
-    async def fetch_novel_info(self, page: Page, novel_url: str) -> Optional[ParsedNovelInfo]:
-        """Loads novel page and extracts all structured metadata, volumes, and chapters."""
+    def _get_headers(self, referer: Optional[str] = None) -> Dict[str, str]:
+        return {
+            "User-Agent": self._ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Upgrade-Insecure-Requests": "1",
+            "Referer": referer or self.config.base_url,
+        }
+
+    async def get_session_client(self) -> httpx.AsyncClient:
+        """Returns or initializes the persistent async session client."""
+        if self._client is None or self._client.is_closed:
+            proxy_url = self.proxy_manager.get_current_proxy() if self.proxy_manager.is_enabled else None
+            self._client = httpx.AsyncClient(
+                proxy=proxy_url,
+                timeout=25.0,
+                headers=self._get_headers(),
+                follow_redirects=True,
+            )
+        return self._client
+
+    async def close_session(self):
+        """Closes the current session client cleanly."""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
+
+    async def _fetch_html_with_retry(self, url: str, referer: Optional[str] = None) -> Optional[str]:
+        """Fetch raw HTML for a novel or chapter page with adaptive backoff, cookies, and rate-limiting."""
+        client = await self.get_session_client()
+
         for attempt in range(1, self.config.max_retries + 1):
             await self.state.proceed.wait()
             await self.state.rate_limiter.acquire()
 
             try:
-                resp = await page.goto(
-                    novel_url,
-                    timeout=self.config.goto_timeout_ms,
-                    wait_until="domcontentloaded",
-                )
+                headers = self._get_headers(referer=referer)
+                resp = await client.get(url, headers=headers)
 
-                if resp and resp.status in (429, 502, 503, 504):
-                    await self.state.rate_limiter.on_429()
-                    backoff = random.uniform(self.config.backoff_429_min, self.config.backoff_429_max)
-                    log.warning(f"[Server Status {resp.status}] Cooldown triggered for {novel_url}. Backoff {backoff:.1f}s...")
-                    await self.state.trigger_backoff(backoff)
-                    await self.state.proceed.wait()
-                    continue
+                if resp.status_code == 200:
+                    self.state.rate_limiter.notify_success(dict(resp.headers))
+                    return resp.text
 
-                # Wait for title to appear
-                await page.locator("span.series-name a, span.series-name").first.wait_for(
-                    timeout=self.config.selector_timeout_ms
-                )
+                if resp.status_code in (403, 404):
+                    log.info(f"[HTTP {resp.status_code}] Chapter locked by admin or not found: {url}")
+                    return None
 
-                html = await page.content()
-                info = NovelParser.parse_novel_html(html, novel_url, self.config.base_url)
-                await self.state.rate_limiter.on_success()
-                return info
+                if resp.status_code in (429, 502, 503, 504):
+                    retry_after_val = None
+                    retry_after = resp.headers.get("retry-after")
+                    if retry_after:
+                        try:
+                            retry_after_val = float(retry_after) + 1.0
+                        except ValueError:
+                            pass
+                    await self.state.rate_limiter.on_429(retry_after_sec=retry_after_val)
 
-            except Exception as e:
-                log.warning(f"[Attempt {attempt}/{self.config.max_retries}] Error loading novel {novel_url}: {e}")
-                if attempt < self.config.max_retries:
+                    if self.proxy_manager.is_enabled:
+                        new_proxy = self.proxy_manager.rotate_proxy()
+                        log.warning(
+                            f"[HTTP {resp.status_code}] Cooldown on {url} -> Rotated proxy to: {new_proxy}"
+                        )
+                        await self.close_session()
+                        client = await self.get_session_client()
+                    else:
+                        retry_after = resp.headers.get("retry-after")
+                        if retry_after:
+                            try:
+                                raw_backoff = float(retry_after) + random.uniform(0.5, 1.5)
+                                backoff = max(self.config.backoff_429_min, min(raw_backoff, self.config.backoff_429_max))
+                            except ValueError:
+                                backoff = random.uniform(self.config.backoff_429_min, self.config.backoff_429_max)
+                        else:
+                            backoff = random.uniform(self.config.backoff_429_min, self.config.backoff_429_max)
+
+                        log.warning(
+                            f"[HTTP {resp.status_code}] Cooldown on {url} -> "
+                            f"Backing off {backoff:.1f}s (Attempt {attempt}/{self.config.max_retries})..."
+                        )
+                        await self.state.trigger_backoff(backoff)
+                        await self.state.proceed.wait()
+                else:
+                    log.warning(f"[HTTP {resp.status_code}] Error on {url} (Attempt {attempt}/{self.config.max_retries})")
                     await asyncio.sleep(self.config.retry_backoff_base ** attempt + random.random())
 
-        log.error(f"[Failed] Could not load novel details: {novel_url}")
+            except (httpx.RequestError, httpx.TimeoutException) as e:
+                log.warning(f"[Network] Error on {url}: {e} (Attempt {attempt}/{self.config.max_retries})")
+                if self.proxy_manager.is_enabled:
+                    self.proxy_manager.rotate_proxy()
+                    await self.close_session()
+                    client = await self.get_session_client()
+                await asyncio.sleep(self.config.retry_backoff_base ** attempt + random.random())
+
+        log.error(f"[Failed] Could not fetch page after {self.config.max_retries} attempts: {url}")
         return None
 
-    async def fetch_chapter_content(
-        self, page: Page, chapter_url: str
-    ) -> Optional[ParsedChapterContent]:
-        """Loads chapter page and extracts text, html, and images."""
-        for attempt in range(1, self.config.max_retries + 1):
-            await self.state.proceed.wait()
-            await self.state.rate_limiter.acquire()
+    async def fetch_novel_info(self, novel_url: str) -> Optional[ParsedNovelInfo]:
+        """Loads novel page via HTTPX, establishes cookies, and extracts all structured metadata and chapters."""
+        html = await self._fetch_html_with_retry(novel_url, referer=self.config.base_url)
+        if not html:
+            return None
+        return NovelParser.parse_novel_html(html, novel_url, self.config.base_url)
 
-            try:
-                resp = await page.goto(
-                    chapter_url,
-                    timeout=self.config.goto_timeout_ms,
-                    wait_until="domcontentloaded",
-                )
-
-                if resp and resp.status in (429, 502, 503, 504):
-                    await self.state.rate_limiter.on_429()
-                    backoff = random.uniform(self.config.backoff_429_min, self.config.backoff_429_max)
-                    log.warning(f"[Server Status {resp.status}] Cooldown triggered for {chapter_url}. Backoff {backoff:.1f}s...")
-                    await self.state.trigger_backoff(backoff)
-                    await self.state.proceed.wait()
-                    continue
-
-                # Wait for chapter content container
-                await page.locator("#chapter-content").first.wait_for(
-                    timeout=self.config.selector_timeout_ms
-                )
-
-                html = await page.content()
-                content = ChapterParser.parse_chapter_html(html, chapter_url, self.config.base_url)
-                await self.state.rate_limiter.on_success()
-                return content
-
-            except Exception as e:
-                log.warning(f"[Attempt {attempt}/{self.config.max_retries}] Error loading chapter {chapter_url}: {e}")
-                if attempt < self.config.max_retries:
-                    await asyncio.sleep(self.config.retry_backoff_base ** attempt + random.random())
-
-        return None
+    async def fetch_chapter_content(self, chapter_url: str, novel_url: Optional[str] = None) -> Optional[ParsedChapterContent]:
+        """Loads chapter page via HTTPX session and extracts/decrypts text, html, and images."""
+        html = await self._fetch_html_with_retry(chapter_url, referer=novel_url or self.config.base_url)
+        if not html:
+            return None
+        return ChapterParser.parse_chapter_html(html, chapter_url, self.config.base_url)
 
     async def crawl_novel(
         self,
-        nav_page: Page,
-        fetch_page: Page,
         novel_url: str,
         force_recrawl: bool = False,
     ) -> Tuple[int, int, int]:
         """
-        Main novel crawling routine.
+        Main novel crawling routine with persistent cookie session and direct XOR decryption.
         Returns: (novel_id, total_chapters, new_chapters_count)
         """
         log.info(f"[Novel] Fetching metadata for: [bold blue]{novel_url}[/bold blue]")
 
-        # 1. Fetch novel page details
-        info = await self.fetch_novel_info(nav_page, novel_url)
+        # 1. Fetch novel page details (this also populates session cookies)
+        info = await self.fetch_novel_info(novel_url)
         if not info:
             await self.repository.add_to_retry_queue(
                 item_type="novel",
@@ -217,7 +265,8 @@ class NovelCrawler:
                 f"[dim]{info.title[:25]}[/dim] › [cyan]{ch_ref.title[:45]}[/cyan]"
             )
 
-            chap_content = await self.fetch_chapter_content(fetch_page, ch_ref.url)
+            # Pass novel_url as Referer and keep cookies
+            chap_content = await self.fetch_chapter_content(ch_ref.url, novel_url=info.url)
 
             if chap_content:
                 # Upsert chapter to DB
@@ -258,7 +307,7 @@ class NovelCrawler:
                     title=ch_ref.title,
                     url=ch_ref.url,
                     crawl_status="failed",
-                    error_message="Chapter content fetch timeout or blocked",
+                    error_message="Chapter content fetch timeout or failed",
                 )
                 await self.repository.upsert_chapter(chap_model)
 
@@ -275,7 +324,7 @@ class NovelCrawler:
                     last_error="Fetch content timeout/failed",
                 )
 
-            # Adaptive delay between chapters
+            # Adaptive polite delay between chapters
             delay = self.state.get_random_chapter_delay()
             await asyncio.sleep(delay)
 

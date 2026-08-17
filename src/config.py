@@ -33,17 +33,17 @@ class CrawlerEngineConfig:
     num_workers: int = 3
 
     # Adaptive Rate Limiter
-    max_rps: float = 2.5
-    min_rps: float = 0.3
-    chapter_delay_min: float = 0.8
-    chapter_delay_max: float = 2.0
-    page_delay_min: float = 2.0
-    page_delay_max: float = 4.0
+    max_rps: float = 0.95
+    min_rps: float = 0.4
+    chapter_delay_min: float = 0.05
+    chapter_delay_max: float = 0.15
+    page_delay_min: float = 0.3
+    page_delay_max: float = 0.8
     random_jitter: bool = True
 
     # 429 & Backoff handling
-    backoff_429_min: float = 60.0
-    backoff_429_max: float = 120.0
+    backoff_429_min: float = 15.0
+    backoff_429_max: float = 30.0
 
     # Timeouts & Retries
     goto_timeout_ms: int = 60000
@@ -87,6 +87,9 @@ class DailyConfig:
     latest_updates_max_pages: int = 5
     auto_retry_failed: bool = True
     export_txt_on_complete: bool = True
+    feed_url_template: str = (
+        "https://docln.sbs/the-loai/slice-of-life?truyendich=1&sangtac=1&convert=1&dangtienhanh=1&tamngung=1&hoanthanh=1&sapxep=capnhat&page={page}"
+    )
 
 
 @dataclass
@@ -218,6 +221,7 @@ def load_config(config_path: Optional[str] = None) -> Settings:
                     latest_updates_max_pages=int(d_data.get("latest_updates_max_pages", settings.daily.latest_updates_max_pages)),
                     auto_retry_failed=d_data.get("auto_retry_failed", settings.daily.auto_retry_failed),
                     export_txt_on_complete=d_data.get("export_txt_on_complete", settings.daily.export_txt_on_complete),
+                    feed_url_template=d_data.get("feed_url_template", settings.daily.feed_url_template),
                 )
 
             if "export" in data:

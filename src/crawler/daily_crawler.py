@@ -1,13 +1,16 @@
 """
-Daily Incremental Sync Engine: Keeps the SQLite Database Always Up-To-Date
+Daily Incremental Sync Engine: Keeps the SQLite Database Always Up-To-Date (Pure HTTPX)
 """
 
 import asyncio
+import random
 import time
 from typing import List, Set, Dict, Any, Optional
-from playwright.async_api import BrowserContext, Page
+import httpx
+from rich.table import Table
+from rich.panel import Panel
+
 from ..config import Settings, CONFIG
-from ..core.browser_manager import BrowserManager
 from ..core.proxy_manager import get_proxy_manager
 from ..core.rate_limiter import SharedCrawlState
 from ..core.retry_manager import PostRetryWorker
@@ -18,10 +21,15 @@ from .media_crawler import MediaCrawler
 from .novel_crawler import NovelCrawler
 from ..utils.exporter import NovelExporter
 from ..utils.logger import get_logger, console
-from rich.table import Table
-from rich.panel import Panel
 
 log = get_logger("daily_crawler")
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+]
 
 
 class DailySyncEngine:
@@ -34,54 +42,86 @@ class DailySyncEngine:
         self.settings = settings or CONFIG
         self.repository = NovelRepository()
         self.proxy_manager = get_proxy_manager()
-        self.browser_manager = BrowserManager(self.settings.crawler, self.proxy_manager)
         self.media_crawler = MediaCrawler(self.settings.media, self.repository, self.proxy_manager)
         self.state = SharedCrawlState(self.settings.crawler)
         self.novel_crawler = NovelCrawler(
-            self.settings.crawler, self.repository, self.media_crawler, self.state, settings=self.settings
+            self.settings.crawler,
+            self.repository,
+            self.media_crawler,
+            self.state,
+            proxy_manager=self.proxy_manager,
+            settings=self.settings,
         )
         self.post_retry_worker = PostRetryWorker(self.repository)
         self.exporter = NovelExporter(self.repository, self.settings.app.output_dir / "novels")
 
-    async def fetch_feed_page(self, page: Page, page_num: int) -> List[UpdatedFeedItem]:
-        """Fetches a single page of the 'Mới cập nhật' catalog."""
-        feed_url = f"{self.settings.crawler.base_url}/danh-sach?sapxep=capnhat&page={page_num}"
+    def _get_headers(self, referer: Optional[str] = None) -> Dict[str, str]:
+        return {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": referer or self.settings.crawler.base_url,
+        }
+
+    async def fetch_feed_page(self, page_num: int) -> List[UpdatedFeedItem]:
+        """Fetches a single page of the configured daily update feed using HTTPX."""
+        template = getattr(self.settings.daily, "feed_url_template", "")
+        if template and "{page}" in template:
+            feed_url = template.format(page=page_num)
+        elif template and "{i}" in template:
+            feed_url = template.format(i=page_num)
+        elif template:
+            feed_url = f"{template}&page={page_num}"
+        else:
+            feed_url = f"{self.settings.crawler.base_url}/the-loai/slice-of-life?truyendich=1&sangtac=1&convert=1&dangtienhanh=1&tamngung=1&hoanthanh=1&sapxep=capnhat&page={page_num}"
+
         log.info(f"[DailyFeed] Scanning page {page_num}: {feed_url}")
 
-        await self.state.proceed.wait()
-        await self.state.rate_limiter.acquire()
+        for attempt in range(1, 4):
+            await self.state.proceed.wait()
+            await self.state.rate_limiter.acquire()
 
-        try:
-            await page.goto(feed_url, timeout=self.settings.crawler.goto_timeout_ms, wait_until="domcontentloaded")
-            await page.locator("div.thumb_attr.series-title a, .series-title a").first.wait_for(
-                timeout=self.settings.crawler.selector_timeout_ms
-            )
-            html = await page.content()
-            items = FeedParser.parse_latest_updates(html, self.settings.crawler.base_url)
-            log.info(f"[DailyFeed] Page {page_num} found {len(items)} updated items.")
-            return items
-        except Exception as e:
-            log.warning(f"[DailyFeed] Failed to scan page {page_num}: {e}")
-            return []
+            proxy_url = self.proxy_manager.get_current_proxy()
+
+            try:
+                async with httpx.AsyncClient(
+                    proxy=proxy_url if proxy_url else None,
+                    timeout=20.0,
+                    headers=self._get_headers(),
+                    follow_redirects=True,
+                ) as client:
+                    resp = await client.get(feed_url)
+
+                    if resp.status_code == 200:
+                        self.state.rate_limiter.notify_success()
+                        items = FeedParser.parse_latest_updates(resp.text, self.settings.crawler.base_url)
+                        log.info(f"[DailyFeed] Page {page_num} found {len(items)} updated items.")
+                        return items
+
+                    if resp.status_code in (429, 502, 503, 504):
+                        await self.state.rate_limiter.on_429()
+                        if self.proxy_manager.is_enabled:
+                            self.proxy_manager.rotate_proxy()
+                        else:
+                            await self.state.trigger_backoff(30.0)
+                    else:
+                        await asyncio.sleep(2.0)
+
+            except Exception as e:
+                log.warning(f"[DailyFeed] Failed to scan page {page_num}: {e}")
+                if self.proxy_manager.is_enabled:
+                    self.proxy_manager.rotate_proxy()
+                await asyncio.sleep(2.0)
+
+        return []
 
     async def run_sync(self, max_pages: Optional[int] = None, force_all: bool = False) -> Dict[str, Any]:
-        """
-        Executes a complete daily sync cycle.
-        """
+        """Executes a complete daily sync cycle."""
         pages_to_check = max_pages or self.settings.daily.latest_updates_max_pages
         start_time = time.monotonic()
 
         log_id = await self.repository.create_crawl_log(crawl_type="daily")
         log.info(f"[DailySync] ★ Starting Daily Sync cycle (Scan up to {pages_to_check} pages) ★")
-
-        context = await self.browser_manager.start()
-        feed_page = await context.new_page()
-        nav_page = await context.new_page()
-        fetch_page = await context.new_page()
-
-        await self.browser_manager.setup_page(feed_page)
-        await self.browser_manager.setup_page(nav_page)
-        await self.browser_manager.setup_page(fetch_page)
 
         watcher_task = asyncio.create_task(self.state.backoff_watcher())
 
@@ -97,7 +137,7 @@ class DailySyncEngine:
         try:
             # 1. Discover all updated novels across feed pages
             for p in range(1, pages_to_check + 1):
-                feed_items = await self.fetch_feed_page(feed_page, p)
+                feed_items = await self.fetch_feed_page(p)
                 if not feed_items:
                     break
                 for item in feed_items:
@@ -134,8 +174,6 @@ class DailySyncEngine:
                 try:
                     log.info(f"[DailySync] ({idx}/{len(novels_to_crawl)}) Syncing: {novel_url}")
                     novel_id, total_ch, new_ch = await self.novel_crawler.crawl_novel(
-                        nav_page=nav_page,
-                        fetch_page=fetch_page,
                         novel_url=novel_url,
                         force_recrawl=False,
                     )
@@ -143,10 +181,6 @@ class DailySyncEngine:
                         items_updated += 1
                         total_new_chapters += new_ch
                         updated_novel_ids.append(novel_id)
-
-                        # Auto-export if configured
-                        if self.settings.daily.export_txt_on_complete and new_ch > 0:
-                            await self.exporter.export_novel_txt(novel_id)
                     else:
                         errors_count += 1
                 except Exception as e:
@@ -157,10 +191,10 @@ class DailySyncEngine:
 
         finally:
             watcher_task.cancel()
-            await feed_page.close()
-            await nav_page.close()
-            await fetch_page.close()
-            await self.browser_manager.close()
+            try:
+                await watcher_task
+            except asyncio.CancelledError:
+                pass
 
         # 4. Post-Retry Phase for any failed chapters or images
         if self.settings.daily.auto_retry_failed:
@@ -187,7 +221,7 @@ class DailySyncEngine:
         )
         await self.repository.update_crawl_log(log_model)
 
-        # 5. Beautiful Summary Table
+        # 5. Summary Table
         table = Table(title="Daily Sync Report", border_style="cyan", show_header=True)
         table.add_column("Metric", style="bold cyan")
         table.add_column("Value", style="bold green")

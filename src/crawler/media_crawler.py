@@ -1,23 +1,35 @@
 """
-Media Crawler: Asynchronous Downloader for Covers and Chapter Illustrations
+Media Crawler: High-Resilience Asynchronous Downloader for Covers and Chapter Illustrations
 """
 
 import asyncio
 import hashlib
+import urllib.parse
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 import httpx
-from ..config import MediaConfig, ProxyConfig
+from ..config import MediaConfig
 from ..core.proxy_manager import ProxyManager, get_proxy_manager
 from ..database.repository import NovelRepository
-from ..utils.helpers import calculate_hash, sanitize_filename
+from ..utils.helpers import sanitize_filename
 from ..utils.logger import get_logger
 
 log = get_logger("media")
 
+DEFAULT_IMAGE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Sec-Fetch-Dest": "image",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "cross-site",
+}
+
 
 class MediaCrawler:
-    """Handles downloading and local storage of novel covers and chapter inline illustrations."""
+    """
+    Handles resilient, high-speed downloading and local caching of novel covers and chapter illustrations
+    with smart anti-hotlink referer routing, retry backoff, and CDN fallback.
+    """
 
     def __init__(
         self,
@@ -30,17 +42,69 @@ class MediaCrawler:
         self.proxy_manager = proxy_manager or get_proxy_manager()
         self._semaphore = asyncio.Semaphore(self.config.max_image_workers)
 
-    async def _get_http_client(self) -> httpx.AsyncClient:
-        proxy_url = self.proxy_manager.get_current_proxy()
-        return httpx.AsyncClient(
-            proxy=proxy_url if proxy_url else None,
-            timeout=self.config.image_timeout_sec,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Referer": "https://docln.sbs/",
-            },
-            follow_redirects=True,
-        )
+    def _get_headers_for_url(self, img_url: str) -> Dict[str, str]:
+        """Chooses the optimal Referer and headers depending on the image host."""
+        headers = dict(DEFAULT_IMAGE_HEADERS)
+        parsed = urllib.parse.urlparse(img_url)
+        host = parsed.netloc.lower()
+
+        # Docln/Hako internal CDNs require Docln Referer
+        if any(domain in host for domain in ("docln.sbs", "docln.net", "hako.vip", "hako.re")):
+            headers["Referer"] = "https://docln.sbs/"
+        # External hosts (blogspot, postimg, imgur, etc.) block cross-site referers (anti-hotlink)
+        elif any(domain in host for domain in ("blogspot.com", "postimg.cc", "imgur.com", "discordapp.com", "catbox.moe", "googleusercontent.com")):
+            headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
+        else:
+            headers.pop("Referer", None)
+
+        return headers
+
+    async def _download_bytes_with_retry(self, img_url: str, max_retries: int = 3) -> Optional[bytes]:
+        """Download raw image bytes with retry, backoff, and fallback CDN support."""
+        headers = self._get_headers_for_url(img_url)
+        proxy_url = self.proxy_manager.get_current_proxy() if self.proxy_manager.is_enabled else None
+
+        # ── Pass 1: Direct Download with Smart Headers ──
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with httpx.AsyncClient(
+                    proxy=proxy_url,
+                    timeout=self.config.image_timeout_sec,
+                    headers=headers,
+                    follow_redirects=True,
+                    verify=False,  # Avoid SSL mismatch on outdated third-party image CDNs
+                ) as client:
+                    resp = await client.get(img_url)
+
+                    if resp.status_code == 200 and len(resp.content) > 100:
+                        return resp.content
+
+                    if resp.status_code == 404:
+                        # Image was permanently deleted on host
+                        break
+
+            except Exception as e:
+                if attempt == max_retries:
+                    log.debug(f"[Media] Attempt {attempt} failed for {img_url}: {e}")
+                await asyncio.sleep(1.0 * attempt)
+
+        # ── Pass 2: Fallback via Global Image CDN Cache (wsrv.nl) ──
+        try:
+            fallback_url = f"https://wsrv.nl/?url={urllib.parse.quote(img_url, safe='')}"
+            async with httpx.AsyncClient(
+                proxy=proxy_url,
+                timeout=self.config.image_timeout_sec,
+                headers=DEFAULT_IMAGE_HEADERS,
+                follow_redirects=True,
+                verify=False,
+            ) as client:
+                resp = await client.get(fallback_url)
+                if resp.status_code == 200 and len(resp.content) > 100:
+                    return resp.content
+        except Exception:
+            pass
+
+        return None
 
     async def download_cover(self, novel_id: int, novel_slug: str, cover_url: str) -> Optional[str]:
         """Download novel cover and store locally."""
@@ -59,23 +123,22 @@ class MediaCrawler:
                 dest_path = self.config.cover_dir / filename
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-                if dest_path.exists() and dest_path.stat().st_size > 0:
+                if dest_path.exists() and dest_path.stat().st_size > 100:
                     local_str = str(dest_path)
                     await self.repository.update_novel_cover_local(novel_id, local_str)
                     return local_str
 
-                async with await self._get_http_client() as client:
-                    resp = await client.get(cover_url)
-                    if resp.status_code == 200 and len(resp.content) > 0:
-                        dest_path.write_bytes(resp.content)
-                        local_str = str(dest_path)
-                        await self.repository.update_novel_cover_local(novel_id, local_str)
-                        log.debug(f"[Media] Saved cover for {novel_slug} ({len(resp.content)} bytes)")
-                        return local_str
-                    else:
-                        log.warning(f"[Media] Failed downloading cover {cover_url} (HTTP {resp.status_code})")
+                img_data = await self._download_bytes_with_retry(cover_url)
+                if img_data:
+                    dest_path.write_bytes(img_data)
+                    local_str = str(dest_path)
+                    await self.repository.update_novel_cover_local(novel_id, local_str)
+                    log.debug(f"[Media] Saved cover for {novel_slug} ({len(img_data)} bytes)")
+                    return local_str
+                else:
+                    log.debug(f"[Media] Could not download cover (expired/deleted on host): {cover_url}")
             except Exception as e:
-                log.warning(f"[Media] Error downloading cover {cover_url}: {e}")
+                log.debug(f"[Media] Error downloading cover {cover_url}: {e}")
         return None
 
     async def download_chapter_image(
@@ -91,7 +154,6 @@ class MediaCrawler:
 
         async with self._semaphore:
             try:
-                # Record image in DB first
                 img_db_id = await self.repository.record_image(
                     novel_id=novel_id,
                     chapter_id=chapter_id,
@@ -111,23 +173,22 @@ class MediaCrawler:
                 novel_folder.mkdir(parents=True, exist_ok=True)
                 dest_path = novel_folder / f"{url_hash}{ext}"
 
-                if dest_path.exists() and dest_path.stat().st_size > 0:
+                if dest_path.exists() and dest_path.stat().st_size > 100:
                     local_str = str(dest_path)
                     await self.repository.mark_image_downloaded(img_db_id, local_str, dest_path.stat().st_size)
                     return local_str
 
-                async with await self._get_http_client() as client:
-                    resp = await client.get(img_url)
-                    if resp.status_code == 200 and len(resp.content) > 0:
-                        dest_path.write_bytes(resp.content)
-                        local_str = str(dest_path)
-                        await self.repository.mark_image_downloaded(img_db_id, local_str, len(resp.content))
-                        log.debug(f"[Media] Saved illustration for {novel_slug}: {dest_path.name}")
-                        return local_str
-                    else:
-                        await self.repository.mark_image_failed(img_db_id, f"HTTP {resp.status_code}")
+                img_data = await self._download_bytes_with_retry(img_url)
+                if img_data:
+                    dest_path.write_bytes(img_data)
+                    local_str = str(dest_path)
+                    await self.repository.mark_image_downloaded(img_db_id, local_str, len(img_data))
+                    log.debug(f"[Media] Saved illustration for {novel_slug}: {dest_path.name}")
+                    return local_str
+                else:
+                    await self.repository.mark_image_failed(img_db_id, "Image expired or deleted on host")
             except Exception as e:
-                log.warning(f"[Media] Error downloading image {img_url}: {e}")
+                log.debug(f"[Media] Error downloading image {img_url}: {e}")
                 if "img_db_id" in locals() and img_db_id:
                     await self.repository.mark_image_failed(img_db_id, str(e))
         return None
