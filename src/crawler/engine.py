@@ -74,6 +74,21 @@ class CrawlerEngine:
                     raise
                 except Exception as e:
                     log.error(f"[Worker {worker_id}] Unhandled error on {novel_url}: {e}")
+                    try:
+                        existing = await self.repository.get_novel_by_url(novel_url)
+                        if existing and existing.id:
+                            await self.repository.update_novel_status(
+                                existing.id,
+                                "error",
+                                error_message=f"Worker exception: {e}",
+                            )
+                        await self.repository.add_to_retry_queue(
+                            item_type="novel",
+                            target_url=novel_url,
+                            last_error=f"Worker exception: {e}",
+                        )
+                    except Exception:
+                        pass
                 finally:
                     queue.task_done()
                     # Polite pause between novels
@@ -103,8 +118,6 @@ class CrawlerEngine:
         for url in urls:
             queue.put_nowait(url)
 
-        watcher_task = asyncio.create_task(self.state.backoff_watcher())
-
         try:
             workers = [
                 asyncio.create_task(
@@ -113,12 +126,10 @@ class CrawlerEngine:
                 for i in range(effective_workers)
             ]
             await asyncio.gather(*workers)
-        finally:
-            watcher_task.cancel()
-            try:
-                await watcher_task
-            except asyncio.CancelledError:
-                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"[Engine] Worker execution error: {e}")
 
         # ── Post-Retry Phase ──
         if self.settings.crawler.enable_post_retry:
@@ -131,19 +142,11 @@ class CrawlerEngine:
 
     async def crawl_single_novel(self, novel_url: str, force_recrawl: bool = False) -> bool:
         """Helper to crawl a single novel."""
-        watcher_task = asyncio.create_task(self.state.backoff_watcher())
-        try:
-            novel_id, total_ch, new_ch = await self.novel_crawler.crawl_novel(
-                novel_url=novel_url,
-                force_recrawl=force_recrawl,
-            )
-            return novel_id > 0
-        finally:
-            watcher_task.cancel()
-            try:
-                await watcher_task
-            except asyncio.CancelledError:
-                pass
+        novel_id, total_ch, new_ch = await self.novel_crawler.crawl_novel(
+            novel_url=novel_url,
+            force_recrawl=force_recrawl,
+        )
+        return novel_id > 0
 
     async def crawl_single_chapter(
         self,
@@ -169,6 +172,7 @@ class CrawlerEngine:
                 html_content=content.html_content,
                 images=content.image_urls,
                 crawl_status="completed",
+                error_message=None,
             )
             chap_id = await self.repository.upsert_chapter(chap_model)
             if content.image_urls:
@@ -181,7 +185,21 @@ class CrawlerEngine:
                     image_urls=content.image_urls,
                 )
             return True
-        return False
+        else:
+            err = getattr(self.novel_crawler, "_last_error", None) or "Chapter content fetch timeout or failed"
+            if novel_id:
+                from ..database.models import Chapter
+                chap_model = Chapter(
+                    novel_id=novel_id,
+                    volume_id=volume_id,
+                    chapter_index=chapter_index,
+                    title=chapter_title,
+                    url=chapter_url,
+                    crawl_status="failed",
+                    error_message=err,
+                )
+                await self.repository.upsert_chapter(chap_model)
+            return False
 
     async def download_single_image(
         self,
@@ -190,6 +208,21 @@ class CrawlerEngine:
         image_type: str = "chapter_illustration",
     ) -> bool:
         """Helper to retry downloading a single image."""
-        if not image_id:
+        if not image_url:
             return False
-        return True
+
+        img_bytes = await self.media_crawler._download_bytes_with_retry(image_url)
+        if img_bytes:
+            if image_id:
+                import hashlib
+                from ..utils.helpers import sanitize_filename
+                url_hash = hashlib.md5(image_url.encode("utf-8")).hexdigest()[:12]
+                dest_path = self.settings.media.chapter_img_dir / "retry" / f"{url_hash}.jpg"
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                dest_path.write_bytes(img_bytes)
+                await self.repository.mark_image_downloaded(image_id, str(dest_path), len(img_bytes))
+            return True
+        else:
+            if image_id:
+                await self.repository.mark_image_failed(image_id, "Post-retry image download failed")
+            return False

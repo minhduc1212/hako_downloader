@@ -29,9 +29,9 @@ class NovelRepository:
             url, slug, title, alternative_titles, author, artist,
             status, novel_type, cover_url, cover_local_path,
             summary, genres, total_words, views, likes, bookmarks,
-            rating, rating_count, site_last_updated, crawl_status, updated_at
+            rating, rating_count, site_last_updated, crawl_status, error_message, updated_at
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
         )
         ON CONFLICT(url) DO UPDATE SET
             slug = excluded.slug,
@@ -53,6 +53,7 @@ class NovelRepository:
             rating_count = excluded.rating_count,
             site_last_updated = excluded.site_last_updated,
             crawl_status = excluded.crawl_status,
+            error_message = excluded.error_message,
             updated_at = CURRENT_TIMESTAMP
         RETURNING id;
         """
@@ -80,6 +81,7 @@ class NovelRepository:
                     novel.rating_count,
                     novel.site_last_updated,
                     novel.crawl_status,
+                    novel.error_message,
                 ),
             )
             row = await cursor.fetchone()
@@ -150,11 +152,16 @@ class NovelRepository:
             await conn.execute(query, (local_path, novel_id))
             await conn.commit()
 
-    async def update_novel_status(self, novel_id: int, status: str):
-        """Update crawl status of novel."""
-        query = "UPDATE novels SET crawl_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;"
+    async def update_novel_status(self, novel_id: int, status: str, error_message: Optional[str] = None):
+        """Update crawl status and error message of novel."""
+        if error_message is not None:
+            query = "UPDATE novels SET crawl_status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;"
+            params = (status, error_message, novel_id)
+        else:
+            query = "UPDATE novels SET crawl_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;"
+            params = (status, novel_id)
         async with self.db_manager.get_connection() as conn:
-            await conn.execute(query, (status, novel_id))
+            await conn.execute(query, params)
             await conn.commit()
 
     # ─────────────────────────────────────────────────────────────
@@ -384,11 +391,42 @@ class NovelRepository:
             )
             await conn.commit()
 
-    async def get_pending_retries(self, limit: int = 50) -> List[RetryItem]:
-        """Fetch pending items from retry queue."""
-        query = "SELECT * FROM retry_queue WHERE status = 'pending' AND attempts < max_attempts ORDER BY attempts ASC, id ASC LIMIT ?;"
+    async def sync_failed_chapters_to_retry_queue(self):
+        """Sync any failed chapters in chapters table into retry_queue to guarantee post-retry execution."""
+        query = """
+        INSERT INTO retry_queue (item_type, target_url, extra_data, attempts, max_attempts, status, last_error, updated_at)
+        SELECT
+            'chapter',
+            c.url,
+            json_object('novel_id', c.novel_id, 'volume_id', c.volume_id, 'chapter_index', c.chapter_index, 'title', c.title),
+            0,
+            3,
+            'pending',
+            COALESCE(c.error_message, 'Chapter marked failed'),
+            CURRENT_TIMESTAMP
+        FROM chapters c
+        WHERE c.crawl_status = 'failed'
+        ON CONFLICT(item_type, target_url) DO UPDATE SET
+            status = CASE WHEN retry_queue.status = 'dead' THEN 'dead' ELSE 'pending' END,
+            last_error = COALESCE(excluded.last_error, retry_queue.last_error),
+            updated_at = CURRENT_TIMESTAMP;
+        """
         async with self.db_manager.get_connection() as conn:
-            cursor = await conn.execute(query, (limit,))
+            await conn.execute(query)
+            await conn.commit()
+
+    async def get_pending_retries(self, limit: Optional[int] = None) -> List[RetryItem]:
+        """Fetch pending items from retry queue. If limit is None or <=0, returns all pending items."""
+        query = "SELECT * FROM retry_queue WHERE status = 'pending' AND attempts < max_attempts ORDER BY attempts ASC, id ASC"
+        params = ()
+        if limit is not None and limit > 0:
+            query += " LIMIT ?;"
+            params = (limit,)
+        else:
+            query += ";"
+
+        async with self.db_manager.get_connection() as conn:
+            cursor = await conn.execute(query, params)
             rows = await cursor.fetchall()
             return [
                 RetryItem(
@@ -513,6 +551,13 @@ class NovelRepository:
             c = await conn.execute("SELECT COUNT(*) AS c FROM chapters WHERE crawl_status = 'completed';")
             stats.total_chapters = (await c.fetchone())["c"]
 
+            # Failed counts
+            c = await conn.execute("SELECT COUNT(*) AS c FROM novels WHERE crawl_status IN ('error', 'failed');")
+            stats.failed_novels = (await c.fetchone())["c"]
+
+            c = await conn.execute("SELECT COUNT(*) AS c FROM chapters WHERE crawl_status = 'failed';")
+            stats.failed_chapters = (await c.fetchone())["c"]
+
             # Image counts
             c = await conn.execute("SELECT COUNT(*) AS c FROM images;")
             stats.total_images = (await c.fetchone())["c"]
@@ -559,6 +604,7 @@ class NovelRepository:
             rating_count=r["rating_count"] or 0,
             site_last_updated=r["site_last_updated"] or "",
             crawl_status=r["crawl_status"] or "completed",
+            error_message=r["error_message"] if "error_message" in r.keys() else None,
             created_at=r["created_at"],
             updated_at=r["updated_at"],
         )

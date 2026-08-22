@@ -61,6 +61,10 @@ class MediaCrawler:
 
     async def _download_bytes_with_retry(self, img_url: str, max_retries: int = 3) -> Optional[bytes]:
         """Download raw image bytes with retry, backoff, and fallback CDN support."""
+        if not img_url or not (img_url.startswith("http://") or img_url.startswith("https://")):
+            log.debug(f"[Media] Skipping invalid or non-HTTP image URL: {img_url}")
+            return None
+
         headers = self._get_headers_for_url(img_url)
         proxy_url = self.proxy_manager.get_current_proxy() if self.proxy_manager.is_enabled else None
 

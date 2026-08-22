@@ -73,12 +73,12 @@ class DailySyncEngine:
         elif template:
             feed_url = f"{template}&page={page_num}"
         else:
-            feed_url = f"{self.settings.crawler.base_url}/the-loai/slice-of-life?truyendich=1&sangtac=1&convert=1&dangtienhanh=1&tamngung=1&hoanthanh=1&sapxep=capnhat&page={page_num}"
+            feed_url = f"{self.settings.crawler.base_url}/danh-sach?truyendich=1&sangtac=1&convert=1&dangtienhanh=1&tamngung=1&hoanthanh=1&sapxep=capnhat&page={page_num}"
 
         log.info(f"[DailyFeed] Scanning page {page_num}: {feed_url}")
 
         for attempt in range(1, 4):
-            await self.state.proceed.wait()
+            await self.state.wait_for_proceed()
             await self.state.rate_limiter.acquire()
 
             proxy_url = self.proxy_manager.get_current_proxy()
@@ -104,6 +104,7 @@ class DailySyncEngine:
                             self.proxy_manager.rotate_proxy()
                         else:
                             await self.state.trigger_backoff(30.0)
+                            await self.state.wait_for_proceed()
                     else:
                         await asyncio.sleep(2.0)
 
@@ -116,14 +117,12 @@ class DailySyncEngine:
         return []
 
     async def run_sync(self, max_pages: Optional[int] = None, force_all: bool = False) -> Dict[str, Any]:
-        """Executes a complete daily sync cycle."""
+        """Executes a complete daily sync cycle: crawls new novels and new chapters from existing novels."""
         pages_to_check = max_pages or self.settings.daily.latest_updates_max_pages
         start_time = time.monotonic()
 
         log_id = await self.repository.create_crawl_log(crawl_type="daily")
         log.info(f"[DailySync] ★ Starting Daily Sync cycle (Scan up to {pages_to_check} pages) ★")
-
-        watcher_task = asyncio.create_task(self.state.backoff_watcher())
 
         all_feed_items: List[UpdatedFeedItem] = []
         seen_novel_urls: Set[str] = set()
@@ -162,17 +161,22 @@ class DailySyncEngine:
                     novels_to_crawl.append(item.novel_url)
                 elif force_all or (item.latest_chapter_url and item.latest_chapter_url not in db_chapter_urls):
                     # Existing novel has new chapter
-                    log.info(f"[DailySync] [NEW CHAPTER] '{item.novel_title}' has update: {item.latest_chapter_title}")
+                    log.info(f"[DailySync] [NEW CHAPTER] '{item.novel_title}' has update: {item.latest_chapter_title or 'new chapters'}")
                     novels_to_crawl.append(item.novel_url)
                 else:
-                    log.debug(f"[DailySync] '{item.novel_title}' already up to date.")
+                    # Even if latest_chapter_url wasn't extracted, queue existing novel to sync any new chapters
+                    log.debug(f"[DailySync] '{item.novel_title}' queuing check for new chapters.")
+                    novels_to_crawl.append(item.novel_url)
 
-            log.info(f"[DailySync] Novels requiring update: [bold yellow]{len(novels_to_crawl)}/{items_checked}[/bold yellow]")
+            # Deduplicate URLs to crawl
+            unique_novels_to_crawl = list(dict.fromkeys(novels_to_crawl))
+            log.info(f"[DailySync] Novels requiring update / chapter sync: [bold yellow]{len(unique_novels_to_crawl)}/{items_checked}[/bold yellow]")
 
-            # 3. Crawl updated novels
-            for idx, novel_url in enumerate(novels_to_crawl, 1):
+            # 3. Crawl updated novels (syncing new chapters and new novels)
+            for idx, novel_url in enumerate(unique_novels_to_crawl, 1):
                 try:
-                    log.info(f"[DailySync] ({idx}/{len(novels_to_crawl)}) Syncing: {novel_url}")
+                    await self.state.wait_for_proceed()
+                    log.info(f"[DailySync] ({idx}/{len(unique_novels_to_crawl)}) Syncing: {novel_url}")
                     novel_id, total_ch, new_ch = await self.novel_crawler.crawl_novel(
                         novel_url=novel_url,
                         force_recrawl=False,
@@ -186,19 +190,27 @@ class DailySyncEngine:
                 except Exception as e:
                     errors_count += 1
                     log.error(f"[DailySync] Error syncing novel {novel_url}: {e}")
+                    # Record error in DB & retry queue
+                    try:
+                        existing = await self.repository.get_novel_by_url(novel_url)
+                        if existing and existing.id:
+                            await self.repository.update_novel_status(existing.id, "error", error_message=f"Daily sync exception: {e}")
+                        await self.repository.add_to_retry_queue(
+                            item_type="novel",
+                            target_url=novel_url,
+                            last_error=f"Daily sync exception: {e}",
+                        )
+                    except Exception:
+                        pass
 
                 await asyncio.sleep(self.state.get_random_page_delay())
 
-        finally:
-            watcher_task.cancel()
-            try:
-                await watcher_task
-            except asyncio.CancelledError:
-                pass
+        except Exception as e:
+            log.error(f"[DailySync] Unexpected error during feed sync: {e}")
 
-        # 4. Post-Retry Phase for any failed chapters or images
+        # 4. Post-Retry Phase for any failed chapters, novels, or images
         if self.settings.daily.auto_retry_failed:
-            log.info("[DailySync] Running Post-Retry phase on pending retry queue...")
+            log.info("[DailySync] Running Post-Retry phase on all pending retry items...")
             from .engine import CrawlerEngine
             engine_helper = CrawlerEngine(self.settings)
             resolved = await self.post_retry_worker.process_pending_retries(engine_helper)

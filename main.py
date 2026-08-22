@@ -52,13 +52,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
 
-    # 1. crawl-all (Full catalog crawl / bootstrap with instant resume)
-    p_all = subparsers.add_parser("crawl-all", help="Crawl the ENTIRE website novel catalog (resumes directly from SQLite DB)")
-    p_all.add_argument("--start-page", type=int, default=1, help="Starting catalog page if rescanning (default: 1)")
-    p_all.add_argument("--end-page", type=int, default=0, help="Ending catalog page if rescanning (0 = all pages)")
+    # 1. crawl-all (Full catalog crawl: rescans all pages, syncs all novels & chapters)
+    p_all = subparsers.add_parser("crawl-all", help="Crawl the ENTIRE website novel catalog (scans all pages, adds new novels & chapters)")
+    p_all.add_argument("--start-page", type=int, default=1, help="Starting catalog page (default: 1)")
+    p_all.add_argument("--end-page", type=int, default=0, help="Ending catalog page (0 = all pages)")
     p_all.add_argument("--workers", "-w", type=int, default=None, help="Number of concurrent workers")
     p_all.add_argument("--force", action="store_true", help="Force re-crawl already completed novels")
-    p_all.add_argument("--rescan", action="store_true", help="Force re-scanning web catalog pages before crawling")
+    p_all.add_argument("--resume-only", action="store_true", help="Only resume incomplete novels in DB without scanning catalog web pages")
     p_all.add_argument("--limit", type=int, default=None, help="Limit number of novels to crawl")
 
     # 2. discover
@@ -146,7 +146,7 @@ async def main_async():
             end_page=args.end_page,
             workers=args.workers,
             force=args.force,
-            rescan=args.rescan,
+            resume_only=args.resume_only,
             limit=args.limit,
             config_path=args.config,
         )

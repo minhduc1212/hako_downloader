@@ -29,7 +29,8 @@ class Novel:
     rating: float = 0.0
     rating_count: int = 0
     site_last_updated: str = ""
-    crawl_status: str = "completed"  # pending, crawling, completed, error
+    crawl_status: str = "completed"  # pending, crawling, completed, partial, error
+    error_message: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -112,6 +113,8 @@ class DBStats:
     total_novels: int = 0
     total_volumes: int = 0
     total_chapters: int = 0
+    failed_novels: int = 0
+    failed_chapters: int = 0
     total_images: int = 0
     downloaded_images: int = 0
     pending_retries: int = 0

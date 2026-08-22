@@ -57,11 +57,15 @@ def normalize_url(url: str, base_url: str = "https://docln.sbs") -> str:
     """Ensure URL is fully qualified and normalized."""
     if not url:
         return ""
+    url = url.strip()
     if url.startswith("//"):
         return "https:" + url
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
     if url.startswith("/"):
         return urljoin(base_url, url)
-    return url
+    return urljoin(base_url.rstrip("/") + "/", url)
+
 
 
 def calculate_hash(data: bytes) -> str:

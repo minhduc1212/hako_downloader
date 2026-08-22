@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Set
 from bs4 import BeautifulSoup
-from ..utils.helpers import extract_novel_slug, normalize_url, clean_text
+from ..utils.helpers import extract_novel_slug, extract_novel_id, normalize_url, clean_text
 
 
 @dataclass
@@ -152,14 +152,36 @@ class NovelParser:
         summary = clean_text(summary_el.text) if summary_el else ""
 
         # 8. Volumes and Chapters Extraction
+        # Decompose comments, discussions, and navigation widgets so user comment links are never mistaken for chapters
+        for noise in soup.select(
+            "section#series-comments, #series-comments, .ln-comment, #ln-comment, "
+            ".comment-wrapper, #comment-section, .fbcmt_root, footer, nav, #navbar, "
+            ".sidebar, .series-users, .same-author, .feature-section, .series-action"
+        ):
+            noise.decompose()
+
+        novel_id = extract_novel_id(novel_url)
+
+        def is_chapter_for_novel(ch_url: str) -> bool:
+            """Ensure chapter URL belongs to the target novel and has valid chapter format."""
+            if not ch_url or not re.search(r"/c\d+", ch_url):
+                return False
+            ch_nid = extract_novel_id(ch_url)
+            ch_slug = extract_novel_slug(ch_url)
+            if novel_id and ch_nid:
+                return ch_nid == novel_id
+            if slug and ch_slug and slug != "novel":
+                return ch_slug == slug or slug in ch_url
+            return True
+
         volumes: List[ParsedVolumeInfo] = []
-        vol_sections = soup.select("section.volume-list, div.volume-list")
+        vol_sections = soup.select("section.volume-list, div.volume-list, .volume-list")
         seen_chapter_urls: Set[str] = set()
         global_chapter_idx = 0
 
         if vol_sections:
             for v_idx, vol in enumerate(vol_sections, 1):
-                vol_title_el = vol.select_one("header.sear-head, header.title-item, .sect-title, .sect-header, span.sect-title")
+                vol_title_el = vol.select_one("header.sear-head, header.title-item, .sect-title, .sect-header, span.sect-title, .volume-title")
                 vol_title = vol_title_el.text.strip() if vol_title_el else f"Quyển {v_idx}"
 
                 vol_info = ParsedVolumeInfo(
@@ -167,15 +189,15 @@ class NovelParser:
                     vol_index=v_idx,
                 )
 
-                chap_els = vol.select("ul.list-chapters .chapter-name a, ul.list-chapters a")
-                date_els = vol.select("ul.list-chapters .chapter-time")
+                chap_els = vol.select("ul.list-chapters .chapter-name a, ul.list-chapters a, .list-chapters li a")
+                date_els = vol.select("ul.list-chapters .chapter-time, .list-chapters .chapter-time")
 
                 for c_idx, chap_a in enumerate(chap_els):
                     href = chap_a.get("href", "")
                     if not href:
                         continue
                     full_ch_url = normalize_url(href, base_url)
-                    if full_ch_url in seen_chapter_urls:
+                    if not full_ch_url or full_ch_url in seen_chapter_urls or not is_chapter_for_novel(full_ch_url):
                         continue
 
                     seen_chapter_urls.add(full_ch_url)
@@ -196,7 +218,7 @@ class NovelParser:
                     volumes.append(vol_info)
 
         # ── Zero-Miss Safety Sweep ──
-        # Check all links on the page for any chapter URLs matching /c\d+ that might have been missed
+        # Check remaining links on the page for any chapter URLs matching /c\d+ that might have been missed
         all_ch_links = soup.find_all("a", href=re.compile(r"/c\d+-[^/]+"))
         missed_chapters = []
 
@@ -205,18 +227,20 @@ class NovelParser:
             if not href:
                 continue
             full_ch_url = normalize_url(href, base_url)
-            if full_ch_url not in seen_chapter_urls:
-                seen_chapter_urls.add(full_ch_url)
-                global_chapter_idx += 1
-                missed_title = a.text.strip() or f"Chương {global_chapter_idx}"
-                missed_chapters.append(
-                    ParsedChapterRef(
-                        title=missed_title,
-                        url=full_ch_url,
-                        publish_date="",
-                        chapter_index=global_chapter_idx,
-                    )
+            if not full_ch_url or full_ch_url in seen_chapter_urls or not is_chapter_for_novel(full_ch_url):
+                continue
+
+            seen_chapter_urls.add(full_ch_url)
+            global_chapter_idx += 1
+            missed_title = a.text.strip() or f"Chương {global_chapter_idx}"
+            missed_chapters.append(
+                ParsedChapterRef(
+                    title=missed_title,
+                    url=full_ch_url,
+                    publish_date="",
+                    chapter_index=global_chapter_idx,
                 )
+            )
 
         if missed_chapters:
             if volumes:

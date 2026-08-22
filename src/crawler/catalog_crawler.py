@@ -246,57 +246,66 @@ class CatalogCrawler:
         end_page: int = 0,
         workers: Optional[int] = None,
         force_recrawl: bool = False,
-        rescan: bool = False,
+        rescan: bool = True,
+        resume_only: bool = False,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
-        Crawls novels from SQLite DB with instant resume capability.
-        Only scans catalog web pages if DB is empty or --rescan is requested.
+        Crawls the entire novel catalog:
+        1. Rescans all catalog web pages to discover all existing and new novels.
+        2. Crawls each novel to fetch metadata, add new novels, and download all new/missing chapters.
+        3. Runs post-retry for all failed chapters/novels.
         """
         start_time = time.monotonic()
         log_id = await self.repository.create_crawl_log(crawl_type="catalog_full")
 
-        total_in_db = await self.repository.get_novels_count()
-        pending_in_db = await self.repository.get_pending_novels_count()
-
-        # 1. Determine URLs to crawl
-        if total_in_db > 0 and not rescan and not force_recrawl:
+        if resume_only:
+            total_in_db = await self.repository.get_novels_count()
+            pending_in_db = await self.repository.get_pending_novels_count()
             log.info(
                 f"[Resume] Found [bold green]{total_in_db:,} novels[/bold green] in SQLite DB "
                 f"([green]{total_in_db - pending_in_db:,} completed[/green], "
                 f"[yellow]{pending_in_db:,} pending[/yellow]). "
-                f"Resuming directly from DB..."
+                f"Resuming only incomplete novels from DB..."
             )
             urls_to_crawl = await self.repository.get_pending_novel_urls(limit=limit)
-            total_items = total_in_db
+            total_items = len(urls_to_crawl)
         else:
-            # Discover from web catalog
-            novel_urls = await self.discover_catalog_urls(start_page=start_page, end_page=end_page)
-            if limit and limit > 0:
-                novel_urls = novel_urls[:limit]
+            # 1. Rescan catalog pages to discover all novels and register new ones
+            log.info("[Catalog] Rescanning catalog pages to index all novels and check for updates...")
+            catalog_urls = await self.discover_catalog_urls(start_page=start_page, end_page=end_page)
 
-            if not force_recrawl:
-                pending_urls = []
-                for u in novel_urls:
-                    n = await self.repository.get_novel_by_url(u)
-                    if not n or n.crawl_status != "completed":
-                        pending_urls.append(u)
-                urls_to_crawl = pending_urls
-            else:
-                urls_to_crawl = novel_urls
-            total_items = len(novel_urls)
+            # 2. Combine catalog discovered URLs with any other novels in DB
+            db_novels = await self.repository.get_all_novels(limit=100000)
+            db_urls = [n.url for n in db_novels]
+
+            # Preserve discovery order and ensure uniqueness
+            seen_urls = set()
+            urls_to_crawl = []
+            for u in catalog_urls + db_urls:
+                if u not in seen_urls:
+                    seen_urls.add(u)
+                    urls_to_crawl.append(u)
+
+            if limit and limit > 0:
+                urls_to_crawl = urls_to_crawl[:limit]
+
+            total_items = len(urls_to_crawl)
 
         if not urls_to_crawl:
-            console.print("[bold green]✓ All novels in SQLite database are already 100% completed![/bold green]")
-            return {"total": total_items, "crawled": 0, "duration": 0.0}
+            console.print("[bold green]✓ No novel URLs found to crawl.[/bold green]")
+            return {"total": 0, "crawled": 0, "duration": 0.0}
 
-        log.info(f"Starting crawl for [bold yellow]{len(urls_to_crawl)} pending novels[/bold yellow]...")
+        log.info(
+            f"Starting full crawl and synchronization for [bold yellow]{len(urls_to_crawl)} novels[/bold yellow] "
+            f"(checking novel metadata, adding new chapters, and new novels)..."
+        )
 
-        # 2. Override worker count if specified
+        # 3. Override worker count if specified
         if workers and workers > 0:
             self.settings.crawler.num_workers = workers
 
-        # 3. Run crawler engine on pending queue
+        # 4. Run crawler engine on all novels
         result = await self.engine.crawl_urls(urls_to_crawl, force_recrawl=force_recrawl)
 
         duration = time.monotonic() - start_time

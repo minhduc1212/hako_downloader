@@ -65,7 +65,7 @@ daily:
   latest_updates_max_pages: 5
   auto_retry_failed: true
   export_txt_on_complete: true
-  feed_url_template: "https://docln.sbs/the-loai/slice-of-life?truyendich=1&sangtac=1&convert=1&dangtienhanh=1&tamngung=1&hoanthanh=1&sapxep=capnhat&page={page}"
+  feed_url_template: "https://docln.sbs/danh-sach?truyendich=1&sangtac=1&convert=1&dangtienhanh=1&tamngung=1&hoanthanh=1&sapxep=capnhat&page={page}"
 
 export:
   output_dir: "output/novels"   # Thư mục lưu file truyện khi xuất (manual export)

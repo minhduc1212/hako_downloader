@@ -51,6 +51,7 @@ class NovelCrawler:
         self.settings = settings or CONFIG
         self._client: Optional[httpx.AsyncClient] = None
         self._ua = random.choice(USER_AGENTS)
+        self._last_error: str = ""
 
     def _get_headers(self, referer: Optional[str] = None) -> Dict[str, str]:
         return {
@@ -84,10 +85,16 @@ class NovelCrawler:
 
     async def _fetch_html_with_retry(self, url: str, referer: Optional[str] = None) -> Optional[str]:
         """Fetch raw HTML for a novel or chapter page with adaptive backoff, cookies, and rate-limiting."""
+        if not url or not (url.startswith("http://") or url.startswith("https://")):
+            self._last_error = f"Invalid or non-HTTP URL: {url}"
+            log.error(f"[Crawler] Skipping invalid or non-HTTP URL: {url}")
+            return None
+
+        self._last_error = ""
         client = await self.get_session_client()
 
         for attempt in range(1, self.config.max_retries + 1):
-            await self.state.proceed.wait()
+            await self.state.wait_for_proceed()
             await self.state.rate_limiter.acquire()
 
             try:
@@ -99,10 +106,12 @@ class NovelCrawler:
                     return resp.text
 
                 if resp.status_code in (403, 404):
+                    self._last_error = f"HTTP {resp.status_code} Locked by admin or not found"
                     log.info(f"[HTTP {resp.status_code}] Chapter locked by admin or not found: {url}")
                     return None
 
                 if resp.status_code in (429, 502, 503, 504):
+                    self._last_error = f"HTTP {resp.status_code} RateLimit / Server busy"
                     retry_after_val = None
                     retry_after = resp.headers.get("retry-after")
                     if retry_after:
@@ -135,12 +144,14 @@ class NovelCrawler:
                             f"Backing off {backoff:.1f}s (Attempt {attempt}/{self.config.max_retries})..."
                         )
                         await self.state.trigger_backoff(backoff)
-                        await self.state.proceed.wait()
+                        await self.state.wait_for_proceed()
                 else:
+                    self._last_error = f"HTTP {resp.status_code} Error"
                     log.warning(f"[HTTP {resp.status_code}] Error on {url} (Attempt {attempt}/{self.config.max_retries})")
                     await asyncio.sleep(self.config.retry_backoff_base ** attempt + random.random())
 
             except (httpx.RequestError, httpx.TimeoutException) as e:
+                self._last_error = f"Network Exception: {e}"
                 log.warning(f"[Network] Error on {url}: {e} (Attempt {attempt}/{self.config.max_retries})")
                 if self.proxy_manager.is_enabled:
                     self.proxy_manager.rotate_proxy()
@@ -148,6 +159,8 @@ class NovelCrawler:
                     client = await self.get_session_client()
                 await asyncio.sleep(self.config.retry_backoff_base ** attempt + random.random())
 
+        if not self._last_error:
+            self._last_error = f"Failed to fetch page after {self.config.max_retries} attempts"
         log.error(f"[Failed] Could not fetch page after {self.config.max_retries} attempts: {url}")
         return None
 
@@ -179,10 +192,26 @@ class NovelCrawler:
         # 1. Fetch novel page details (this also populates session cookies)
         info = await self.fetch_novel_info(novel_url)
         if not info:
+            err = self._last_error or "Failed to fetch novel metadata"
+            existing = await self.repository.get_novel_by_url(novel_url)
+            if existing and existing.id:
+                await self.repository.update_novel_status(existing.id, "error", error_message=err)
+            else:
+                from ..utils.helpers import extract_novel_slug
+                slug = extract_novel_slug(novel_url)
+                stub_novel = Novel(
+                    url=novel_url,
+                    slug=slug,
+                    title=slug,
+                    crawl_status="error",
+                    error_message=err,
+                )
+                await self.repository.upsert_novel(stub_novel)
+
             await self.repository.add_to_retry_queue(
                 item_type="novel",
                 target_url=novel_url,
-                last_error="Failed to fetch novel metadata",
+                last_error=err,
             )
             return (0, 0, 0)
 
@@ -207,6 +236,7 @@ class NovelCrawler:
             rating_count=info.rating_count,
             site_last_updated=info.site_last_updated,
             crawl_status="crawling",
+            error_message=None,
         )
         novel_id = await self.repository.upsert_novel(novel_obj)
         novel_obj.id = novel_id
@@ -258,6 +288,7 @@ class NovelCrawler:
 
         new_chapters_count = 0
         novel_total_words = 0
+        failed_chapters_count = 0
 
         for idx, (vol_id, ch_ref) in enumerate(chapters_to_process, 1):
             log.info(
@@ -282,6 +313,7 @@ class NovelCrawler:
                     html_content=chap_content.html_content,
                     images=chap_content.image_urls,
                     crawl_status="completed",
+                    error_message=None,
                 )
                 chap_id = await self.repository.upsert_chapter(chap_model)
                 new_chapters_count += 1
@@ -298,7 +330,9 @@ class NovelCrawler:
                         )
                     )
             else:
-                log.error(f"  [Chapter Failed] {ch_ref.title} ({ch_ref.url}) -> Queueing for Post-Retry")
+                err = self._last_error or "Chapter content fetch timeout or failed"
+                failed_chapters_count += 1
+                log.error(f"  [Chapter Failed] {ch_ref.title} ({ch_ref.url}) -> {err}")
                 # Record failed chapter in DB
                 chap_model = Chapter(
                     novel_id=novel_id,
@@ -307,7 +341,7 @@ class NovelCrawler:
                     title=ch_ref.title,
                     url=ch_ref.url,
                     crawl_status="failed",
-                    error_message="Chapter content fetch timeout or failed",
+                    error_message=err,
                 )
                 await self.repository.upsert_chapter(chap_model)
 
@@ -321,14 +355,25 @@ class NovelCrawler:
                         "chapter_index": ch_ref.chapter_index,
                         "title": ch_ref.title,
                     },
-                    last_error="Fetch content timeout/failed",
+                    last_error=err,
                 )
 
             # Adaptive polite delay between chapters
             delay = self.state.get_random_chapter_delay()
             await asyncio.sleep(delay)
 
-        # Mark novel completed
-        await self.repository.update_novel_status(novel_id, "completed")
-        log.info(f"[Done] Novel completed: [bold green]{info.title}[/bold green] (+{new_chapters_count} new chapters)")
+        # Update novel status
+        if failed_chapters_count > 0:
+            await self.repository.update_novel_status(
+                novel_id,
+                "partial",
+                error_message=f"{failed_chapters_count} chapter(s) failed during crawl",
+            )
+            log.warning(
+                f"[Partial] Novel crawled with {failed_chapters_count} failed chapters: {info.title}"
+            )
+        else:
+            await self.repository.update_novel_status(novel_id, "completed")
+            log.info(f"[Done] Novel completed: [bold green]{info.title}[/bold green] (+{new_chapters_count} new chapters)")
+
         return (novel_id, total_chapters, new_chapters_count)

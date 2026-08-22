@@ -140,6 +140,7 @@ class SharedCrawlState:
     proceed: Event = field(default_factory=Event)
     _backoff_lock: Lock = field(default_factory=Lock)
     _backoff_until: float = 0.0
+    _backoff_task: Optional[asyncio.Task] = None
     completed_novel_urls: Set[str] = field(default_factory=set)
     completed_chapter_urls: Set[str] = field(default_factory=set)
     lock: Lock = field(default_factory=Lock)
@@ -153,7 +154,7 @@ class SharedCrawlState:
         self.proceed.set()
 
     async def trigger_backoff(self, duration_sec: float):
-        """Pause all crawler workers globally for duration_sec."""
+        """Pause all crawler workers globally for duration_sec with automatic self-resume."""
         async with self._backoff_lock:
             target = time.monotonic() + duration_sec
             if target > self._backoff_until:
@@ -163,16 +164,56 @@ class SharedCrawlState:
                     f"[Backoff] Pausing all workers for {duration_sec:.1f}s "
                     f"(resumes at +{duration_sec:.1f}s)"
                 )
+                if self._backoff_task and not self._backoff_task.done():
+                    self._backoff_task.cancel()
+                self._backoff_task = asyncio.create_task(self._auto_resume_timer())
+
+    async def _auto_resume_timer(self):
+        """Internal self-timer that automatically wakes workers up when backoff expires."""
+        try:
+            while True:
+                remaining = self._backoff_until - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(max(0.1, remaining), 0.5))
+            async with self._backoff_lock:
+                self._backoff_until = 0.0
+                self.proceed.set()
+                log.info("[Backoff] Global backoff period ended. Resuming crawler workers.")
+        except asyncio.CancelledError:
+            pass
+
+    async def wait_for_proceed(self):
+        """
+        Safe wait for backoff with timeout safeguard.
+        Guarantees that workers will NEVER deadlock or hang indefinitely.
+        """
+        while not self.proceed.is_set():
+            remaining = self._backoff_until - time.monotonic()
+            if remaining <= 0:
+                async with self._backoff_lock:
+                    self._backoff_until = 0.0
+                    self.proceed.set()
+                log.info("[Backoff] Backoff duration reached. Resuming.")
+                break
+            try:
+                await asyncio.wait_for(self.proceed.wait(), timeout=min(max(0.2, remaining), 1.0))
+            except asyncio.TimeoutError:
+                pass
 
     async def backoff_watcher(self):
-        """Background task that wakes workers up once the backoff period expires."""
-        while True:
-            await asyncio.sleep(0.5)
-            if not self.proceed.is_set():
-                async with self._backoff_lock:
-                    if time.monotonic() >= self._backoff_until:
-                        self.proceed.set()
-                        log.info("[Backoff] Global backoff period ended. Resuming crawler workers.")
+        """Background compatibility task (internal _auto_resume_timer also handles this)."""
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                if not self.proceed.is_set():
+                    async with self._backoff_lock:
+                        if time.monotonic() >= self._backoff_until:
+                            self._backoff_until = 0.0
+                            self.proceed.set()
+                            log.info("[Backoff] Global backoff period ended. Resuming crawler workers.")
+        except asyncio.CancelledError:
+            pass
 
     def get_random_chapter_delay(self) -> float:
         """Calculate small jitter delay between chapters."""

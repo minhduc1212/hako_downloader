@@ -29,11 +29,12 @@ async def handle_crawl_all(
     end_page: int = 0,
     workers: Optional[int] = None,
     force: bool = False,
-    rescan: bool = False,
+    rescan: bool = True,
+    resume_only: bool = False,
     limit: Optional[int] = None,
     config_path: Optional[str] = None,
 ):
-    """Scrape and crawl the entire website novel catalog (all pages) with instant DB resume."""
+    """Scrape and crawl the entire website novel catalog (all pages) to add new chapters and new novels."""
     settings = load_config(config_path) if config_path else CONFIG
     crawler = CatalogCrawler(settings)
     await crawler.crawl_all_catalog(
@@ -42,6 +43,7 @@ async def handle_crawl_all(
         workers=workers,
         force_recrawl=force,
         rescan=rescan,
+        resume_only=resume_only,
         limit=limit,
     )
 
@@ -146,7 +148,7 @@ async def handle_retry_failed(config_path: Optional[str] = None):
     """Run post-retry processor on all pending items in retry queue."""
     settings = load_config(config_path) if config_path else CONFIG
     engine = CrawlerEngine(settings)
-    resolved = await engine.post_retry_worker.process_pending_retries(engine, batch_size=100)
+    resolved = await engine.post_retry_worker.process_pending_retries(engine)
     console.print(f"[bold green]✓ Post-Retry complete: {resolved} items resolved.[/bold green]")
 
 
@@ -244,6 +246,8 @@ async def handle_stats():
     table.add_row("Total Novels in DB", f"{stats.total_novels:,}")
     table.add_row("Total Volumes", f"{stats.total_volumes:,}")
     table.add_row("Total Completed Chapters", f"{stats.total_chapters:,}")
+    table.add_row("Failed / Incomplete Novels", f"[red]{stats.failed_novels:,}[/red]" if stats.failed_novels else "0")
+    table.add_row("Failed Chapters", f"[red]{stats.failed_chapters:,}[/red]" if stats.failed_chapters else "0")
     table.add_row("Total Registered Images", f"{stats.total_images:,}")
     table.add_row("Downloaded Images", f"{stats.downloaded_images:,}")
     table.add_row("Pending Retry Queue", f"[yellow]{stats.pending_retries}[/yellow]" if stats.pending_retries else "0")

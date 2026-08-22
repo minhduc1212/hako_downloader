@@ -88,7 +88,7 @@ class DailyConfig:
     auto_retry_failed: bool = True
     export_txt_on_complete: bool = True
     feed_url_template: str = (
-        "https://docln.sbs/the-loai/slice-of-life?truyendich=1&sangtac=1&convert=1&dangtienhanh=1&tamngung=1&hoanthanh=1&sapxep=capnhat&page={page}"
+        "https://docln.sbs/danh-sach?truyendich=1&sangtac=1&convert=1&dangtienhanh=1&tamngung=1&hoanthanh=1&sapxep=capnhat&page={page}"
     )
 
 

@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS novels (
     rating_count INTEGER DEFAULT 0,
     site_last_updated TEXT DEFAULT '',
     crawl_status TEXT DEFAULT 'completed',
+    error_message TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS novels (
 CREATE INDEX IF NOT EXISTS idx_novels_url ON novels(url);
 CREATE INDEX IF NOT EXISTS idx_novels_slug ON novels(slug);
 CREATE INDEX IF NOT EXISTS idx_novels_updated ON novels(updated_at);
+CREATE INDEX IF NOT EXISTS idx_novels_status ON novels(crawl_status);
 
 -- Bảng lưu trữ các Tập / Quyển (Volume)
 CREATE TABLE IF NOT EXISTS volumes (
@@ -157,6 +159,10 @@ class DatabaseManager:
             cursor.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms};")
             cursor.execute("PRAGMA foreign_keys = ON;")
             cursor.executescript(SCHEMA_SQL)
+            try:
+                cursor.execute("ALTER TABLE novels ADD COLUMN error_message TEXT;")
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
         log.debug(f"SQLite DB initialized at {self.db_path} (WAL={self.wal_mode})")
 
